@@ -86,7 +86,22 @@ void PrintGrid(int **grid)
     printf("\n\n\n");
 }
 
-int GetAliveNeighbors(int **grid, int line, int column)
+int GetAliveResponse(int gridIndex, int i, int j)
+{
+    int req[] = {gridIndex, i, j};
+    int response;
+    int targetProccess = i / (N / noProcesses);
+
+    printf("Proccess %d requiring info from procces %d\n", processId, targetProccess);
+
+    MPI_Status status;
+    MPI_Send(&req, 3, MPI_INT, targetProccess, REQ, MPI_COMM_WORLD);
+    MPI_Recv(&response, 1, MPI_INT, targetProccess, RES, MPI_COMM_WORLD, &status);
+
+    return response;
+}
+
+int GetAliveNeighbors(int **grid, int line, int column, int startLine, int endLine, int gridIndex)
 {
     int alive = 0;
     int j = 0;
@@ -106,8 +121,15 @@ int GetAliveNeighbors(int **grid, int line, int column)
         if (current > N - 1)
             current = 0;
 
-        if (grid[above][current] == 1)
-            alive++;
+        if (above >= startLine && above <= endLine)
+        {
+            if (grid[above][current] == 1)
+                alive++;
+        }
+        else
+        {
+            alive += GetAliveResponse(gridIndex, above, current);
+        }
     }
 
     // obter linha abaixo
@@ -124,8 +146,15 @@ int GetAliveNeighbors(int **grid, int line, int column)
         if (current > N - 1)
             current = 0;
 
-        if (grid[below][current] == 1)
-            alive++;
+        if (below >= startLine && below <= endLine)
+        {
+            if (grid[below][current] == 1)
+                alive++;
+        }
+        else
+        {
+            alive += GetAliveResponse(gridIndex, below, current);
+        }
     }
 
     // checar esquerda
@@ -141,9 +170,9 @@ int GetAliveNeighbors(int **grid, int line, int column)
     return alive;
 }
 
-int GetNewState(int **grid, int line, int column)
+int GetNewState(int **grid, int line, int column, int startLine, int endLine, int gridIndex)
 {
-    int neighbors = GetAliveNeighbors(grid, line, column);
+    int neighbors = GetAliveNeighbors(grid, line, column, startLine, endLine, gridIndex);
 
     // A célula está viva?
     if (grid[line][column] == 1)
@@ -211,49 +240,43 @@ int **GetNextGrid(int **gridA, int **gridB, int iteration)
         return gridA;
 }
 
-void PlayGameOfLife(int **gridA, int **gridB, int iterations)
+void PlayGameOfLife(int **gridA, int **gridB, int iterations, int startLine, int endLine)
 {
     int i, j, k;
-    int th_id;
-    int print_thread_num = 0;
 
     for (k = 0; k < iterations; k++)
     {
         int **nextGrid = GetNextGrid(gridA, gridB, k);
         int **currentGrid = GetCurrentGrid(gridA, gridB, k);
 
-        /*if (k < 5)
-            PrintGrid(currentGrid);*/
-
-#pragma omp parallel default(none) shared(nextGrid, currentGrid, print_thread_num) private(i, j, th_id)
+        for (i = 0; i < N; i++)
         {
-            th_id = omp_get_thread_num();
-            if (th_id == 0 && print_thread_num == 0)
-            {
-                printf("Numero de threads: %d\n\n", omp_get_num_threads());
-                print_thread_num = 1;
-            }
-
-#pragma omp for
-            for (i = 0; i < N; i++)
+            if (i >= startLine && i <= endLine)
             {
                 for (j = 0; j < N; j++)
                 {
-                    nextGrid[i][j] = GetNewState(currentGrid, i, j);
+                    nextGrid[i - GetOffset()][j] = GetNewState(currentGrid, i, j, startLine, endLine, k % 2);
                 }
             }
         }
+
+        MPI_Barrier(MPI_COMM_WORLD);
     }
 }
 
-void *ReveiceMessage()
+void *ReveiceMessage(void *reqProccess)
 {
-    while ((1))
+    int *pointer = (int *)reqProccess;
+    int proccess = *pointer;
+    free(pointer);
+    while (1)
     {
         int response[] = {0, 0, 0};
 
         MPI_Status status;
-        MPI_Recv(&response, 3, MPI_INT, 0, REQ, MPI_COMM_WORLD, &status);
+        MPI_Recv(&response, 3, MPI_INT, proccess, REQ, MPI_COMM_WORLD, &status);
+
+        printf("Proccess [%d] receive message from proccess [%d]\n", processId, proccess);
 
         int gridIndex = response[0];
         int i = response[1];
@@ -261,7 +284,7 @@ void *ReveiceMessage()
 
         int aliveResponde = GetCurrentGrid(gridA, gridB, gridIndex)[i - GetOffset()][j];
 
-        MPI_Send(&aliveResponde, 1, MPI_INT, 0, RES, MPI_COMM_WORLD);
+        MPI_Send(&aliveResponde, 1, MPI_INT, proccess, RES, MPI_COMM_WORLD);
     }
 }
 
@@ -301,6 +324,20 @@ int main(int argc, char *argv[])
     FillGlider(gridA, startLine, endLine);
     FillRPentonimo(gridA, startLine, endLine);
 
+    /*for (i = 0; i < noProcesses; i++)
+    {
+        if (i != processId)
+        {
+            int *id = (int *)malloc(sizeof(int));
+            *id = i;
+            pthread_create(&receive_thread, NULL, ReveiceMessage, (void *)id);
+        }
+    }*/
+
+    printf("Proccess %d before barrier\n", processId);
+    MPI_Barrier(MPI_COMM_WORLD);
+    printf("Proccess %d after barrier\n", processId);
+
     if (processId == 0)
     {
         printf("*** Game of Life (OPEN MP)\n");
@@ -308,11 +345,21 @@ int main(int argc, char *argv[])
     }
     else
     {
-        pthread_create(&receive_thread, NULL, ReveiceMessage, NULL);
+        for (i = 0; i < noProcesses; i++)
+        {
+            if (i != processId)
+            {
+                int *id = (int *)malloc(sizeof(int));
+                *id = i;
+                pthread_create(&receive_thread, NULL, ReveiceMessage, (void *)id);
+            }
+        }
     }
 
+    MPI_Barrier(MPI_COMM_WORLD);
+
     /*start = omp_get_wtime();
-    PlayGameOfLife(gridA, gridB, 2001);
+    PlayGameOfLife(gridA, gridB, 2001, startLine, endLine);
     end = omp_get_wtime();*/
 
     if (processId == 0)
@@ -325,6 +372,9 @@ int main(int argc, char *argv[])
         pthread_exit(NULL);
     }
 
+    MPI_Barrier(MPI_COMM_WORLD);
+
     MPI_Finalize();
+
     return 0;
 }
