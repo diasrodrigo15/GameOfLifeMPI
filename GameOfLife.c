@@ -7,11 +7,10 @@
 #include <stdlib.h>
 #include <mpi.h>
 #include <omp.h>
-#include <pthread.h>
 
 #define N 2048
-#define REQ 0
-#define RES 1
+#define REQL 0
+#define SURV 1
 
 int processId;   /* rank do processo */
 int noProcesses; /* Número de processos */
@@ -70,45 +69,11 @@ void FillRPentonimo(int **grid, int startLine, int endLine)
     }
 }
 
-void PrintGrid(int **grid)
-{
-    int i, j;
-    for (i = 0; i < 50; i++)
-    {
-        for (j = 0; j < 50; j++)
-        {
-            char c = grid[i][j] == 1 ? '*' : '.';
-            printf("%c", c);
-        }
-
-        printf("\n");
-    }
-    printf("\n\n\n");
-}
-
-int GetAliveResponse(int gridIndex, int i, int j)
-{
-    int req[] = {gridIndex, i, j};
-    int response;
-    int targetProccess = i / (N / noProcesses);
-
-    printf("Proccess %d requiring info from procces %d\n", processId, targetProccess);
-
-    MPI_Status status;
-    MPI_Send(&req, 3, MPI_INT, targetProccess, REQ, MPI_COMM_WORLD);
-    MPI_Recv(&response, 1, MPI_INT, targetProccess, RES, MPI_COMM_WORLD, &status);
-
-    return response;
-}
-
-int GetAliveNeighbors(int **grid, int line, int column, int startLine, int endLine, int gridIndex)
+int GetAliveNeighbors(int **grid, int line, int column, int startLine, int endLine, int *above, int *below)
 {
     int alive = 0;
     int j = 0;
     int current = 0;
-
-    // obter índice de linha acima
-    int above = line == 0 ? N - 1 : line - 1;
 
     // checar linha de cima
     for (j = column - 1; j <= column + 1; j++)
@@ -121,19 +86,8 @@ int GetAliveNeighbors(int **grid, int line, int column, int startLine, int endLi
         if (current > N - 1)
             current = 0;
 
-        if (above >= startLine && above <= endLine)
-        {
-            if (grid[above][current] == 1)
-                alive++;
-        }
-        else
-        {
-            alive += GetAliveResponse(gridIndex, above, current);
-        }
+        alive += above[current];
     }
-
-    // obter linha abaixo
-    int below = (line + 1) % N;
 
     // checar linha de baixo
     for (j = column - 1; j <= column + 1; j++)
@@ -146,36 +100,28 @@ int GetAliveNeighbors(int **grid, int line, int column, int startLine, int endLi
         if (current > N - 1)
             current = 0;
 
-        if (below >= startLine && below <= endLine)
-        {
-            if (grid[below][current] == 1)
-                alive++;
-        }
-        else
-        {
-            alive += GetAliveResponse(gridIndex, below, current);
-        }
+        alive += below[current];
     }
 
     // checar esquerda
     int left = column > 0 ? column - 1 : N - 1;
-    if (grid[line][left] == 1)
+    if (grid[line - GetOffset()][left] == 1)
         alive++;
 
     // checar direita
     int right = column < N - 1 ? column + 1 : 0;
-    if (grid[line][right] == 1)
+    if (grid[line - GetOffset()][right] == 1)
         alive++;
 
     return alive;
 }
 
-int GetNewState(int **grid, int line, int column, int startLine, int endLine, int gridIndex)
+int GetNewState(int **grid, int line, int column, int startLine, int endLine, int *above, int *below)
 {
-    int neighbors = GetAliveNeighbors(grid, line, column, startLine, endLine, gridIndex);
+    int neighbors = GetAliveNeighbors(grid, line, column, startLine, endLine, above, below);
 
     // A célula está viva?
-    if (grid[line][column] == 1)
+    if (grid[line - GetOffset()][column] == 1)
     {
         // mantém-se viva
         if (neighbors == 2 || neighbors == 3)
@@ -193,35 +139,75 @@ int GetNewState(int **grid, int line, int column, int startLine, int endLine, in
     return 0;
 }
 
-int GetSurvivors(int **grid, int startLine, int endLine, int gridIndex)
+int GetSurvivors(int **grid, int startLine, int endLine)
 {
     int alive = 0;
     int i, j;
 
-    for (i = 0; i < N; i++)
+    for (i = startLine; i <= endLine; i++)
     {
         for (j = 0; j < N; j++)
         {
-            if (i >= startLine && i <= endLine)
-            {
-                alive += grid[i][j];
-            }
-            else
-            {
-                int i_j[] = {gridIndex, i, j};
-                int response;
-                int targetProccess = i / (N / noProcesses);
-                MPI_Status status;
-
-                MPI_Send(&i_j, 3, MPI_INT, targetProccess, REQ, MPI_COMM_WORLD);
-                MPI_Recv(&response, 1, MPI_INT, targetProccess, RES, MPI_COMM_WORLD, &status);
-
-                alive += response;
-            }
+            alive += grid[i - GetOffset()][j];
         }
     }
 
+    for (int i = 1; i < noProcesses; i++)
+    {
+        int response;
+        MPI_Status status;
+
+        MPI_Recv(&response, 1, MPI_INT, i, SURV, MPI_COMM_WORLD, &status);
+
+        alive += response;
+    }
+
     return alive;
+}
+
+void SendSurvivors(int **grid, int startLine, int endLine)
+{
+    int alive = 0;
+    int i, j;
+
+    for (i = startLine; i <= endLine; i++)
+    {
+        for (j = 0; j < N; j++)
+        {
+            alive += grid[i - GetOffset()][j];
+        }
+    }
+
+    MPI_Send(&alive, 1, MPI_INT, 0, SURV, MPI_COMM_WORLD);
+}
+
+void SendLine(int *line, int targetProccess)
+{
+    int lineToSend[N];
+    int i;
+    for (i = 0; i < N; i++)
+    {
+        lineToSend[i] = line[i];
+    }
+
+    MPI_Send(&lineToSend, N, MPI_INT, targetProccess, REQL, MPI_COMM_WORLD);
+}
+
+int *ReceiveLine(int proccess)
+{
+    int line[N];
+    MPI_Status status;
+
+    MPI_Recv(&line, N, MPI_INT, proccess, REQL, MPI_COMM_WORLD, &status);
+
+    int *lineToReturn = (int *)malloc(sizeof(int) * N);
+    int i;
+    for (i = 0; i < N; i++)
+    {
+        lineToReturn[i] = line[i];
+    }
+
+    return lineToReturn;
 }
 
 int **GetCurrentGrid(int **gridA, int **gridB, int iteration)
@@ -249,42 +235,37 @@ void PlayGameOfLife(int **gridA, int **gridB, int iterations, int startLine, int
         int **nextGrid = GetNextGrid(gridA, gridB, k);
         int **currentGrid = GetCurrentGrid(gridA, gridB, k);
 
-        for (i = 0; i < N; i++)
+        int *above, *below;
+
+        if (processId == 0)
         {
-            if (i >= startLine && i <= endLine)
+            SendLine(currentGrid[endLine - GetOffset()], processId + 1);
+            above = ReceiveLine(noProcesses - 1);
+
+            SendLine(currentGrid[startLine - GetOffset()], noProcesses - 1);
+            below = ReceiveLine(processId + 1);
+        }
+        else
+        {
+            above = ReceiveLine(processId - 1);
+            SendLine(currentGrid[endLine - GetOffset()], (processId + 1) % noProcesses);
+
+            below = ReceiveLine((processId + 1) % noProcesses);
+            SendLine(currentGrid[startLine - GetOffset()], processId - 1);
+        }
+
+        for (i = startLine; i <= endLine; i++)
+        {
+            int *lineAbove = i == startLine ? above : currentGrid[i - GetOffset() - 1];
+            int *lineBelow = i == endLine ? below : currentGrid[i - GetOffset() + 1];
+            for (j = 0; j < N; j++)
             {
-                for (j = 0; j < N; j++)
-                {
-                    nextGrid[i - GetOffset()][j] = GetNewState(currentGrid, i, j, startLine, endLine, k % 2);
-                }
+                nextGrid[i - GetOffset()][j] = GetNewState(currentGrid, i, j, startLine, endLine, lineAbove, lineBelow);
             }
         }
 
-        MPI_Barrier(MPI_COMM_WORLD);
-    }
-}
-
-void *ReveiceMessage(void *reqProccess)
-{
-    int *pointer = (int *)reqProccess;
-    int proccess = *pointer;
-    free(pointer);
-    while (1)
-    {
-        int response[] = {0, 0, 0};
-
-        MPI_Status status;
-        MPI_Recv(&response, 3, MPI_INT, proccess, REQ, MPI_COMM_WORLD, &status);
-
-        printf("Proccess [%d] receive message from proccess [%d]\n", processId, proccess);
-
-        int gridIndex = response[0];
-        int i = response[1];
-        int j = response[2];
-
-        int aliveResponde = GetCurrentGrid(gridA, gridB, gridIndex)[i - GetOffset()][j];
-
-        MPI_Send(&aliveResponde, 1, MPI_INT, proccess, RES, MPI_COMM_WORLD);
+        free(above);
+        free(below);
     }
 }
 
@@ -306,7 +287,6 @@ int main(int argc, char *argv[])
     gridB = (int **)malloc(linesPerProccess * sizeof(int *));
 
     double start, end;
-    pthread_t receive_thread;
 
     int i = 0, j = 0;
     for (i = 0; i < linesPerProccess; i++)
@@ -324,55 +304,29 @@ int main(int argc, char *argv[])
     FillGlider(gridA, startLine, endLine);
     FillRPentonimo(gridA, startLine, endLine);
 
-    /*for (i = 0; i < noProcesses; i++)
-    {
-        if (i != processId)
-        {
-            int *id = (int *)malloc(sizeof(int));
-            *id = i;
-            pthread_create(&receive_thread, NULL, ReveiceMessage, (void *)id);
-        }
-    }*/
-
-    printf("Proccess %d before barrier\n", processId);
-    MPI_Barrier(MPI_COMM_WORLD);
-    printf("Proccess %d after barrier\n", processId);
-
     if (processId == 0)
     {
         printf("*** Game of Life (OPEN MP)\n");
-        printf("Condição inicial: %d\n", GetSurvivors(gridA, startLine, endLine, 0));
+        printf("Condição inicial: %d\n", GetSurvivors(gridA, startLine, endLine));
     }
     else
     {
-        for (i = 0; i < noProcesses; i++)
-        {
-            if (i != processId)
-            {
-                int *id = (int *)malloc(sizeof(int));
-                *id = i;
-                pthread_create(&receive_thread, NULL, ReveiceMessage, (void *)id);
-            }
-        }
+        SendSurvivors(gridA, startLine, endLine);
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    /*start = omp_get_wtime();
+    start = omp_get_wtime();
     PlayGameOfLife(gridA, gridB, 2001, startLine, endLine);
-    end = omp_get_wtime();*/
+    end = omp_get_wtime();
 
     if (processId == 0)
     {
-        printf("Última geração (2000 iterações): %d\n", GetSurvivors(gridB, startLine, endLine, 1));
+        printf("Última geração (2000 iterações): %d\n", GetSurvivors(gridB, startLine, endLine));
         printf("Tempo execução: %f\n", end - start);
     }
     else
     {
-        pthread_exit(NULL);
+        SendSurvivors(gridB, startLine, endLine);
     }
-
-    MPI_Barrier(MPI_COMM_WORLD);
 
     MPI_Finalize();
 
